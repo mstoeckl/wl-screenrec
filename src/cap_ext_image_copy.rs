@@ -5,6 +5,7 @@ use drm::{buffer::DrmFourcc, node::DrmNode};
 use libc::dev_t;
 use log::warn;
 use log_once::warn_once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wayland_client::{
     globals::GlobalList, protocol::wl_output::WlOutput, Dispatch, Proxy, QueueHandle,
 };
@@ -126,10 +127,9 @@ impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for State<CapExtImageCopy> {
 
                 let cap = state.enc.unwrap_cap();
                 cap.current_config = Some((fmt, size));
-
-                let (width, height, format, frame) = cap
-                    .queue_capture_frame(qhandle)
-                    .expect("Done without size/format!");
+                let Some((width, height, format, frame)) = cap.queue_capture_frame(qhandle) else {
+                    return;
+                };
                 state.on_copy_src_ready(width, height, format, qhandle, &frame);
             }
             ext_image_copy_capture_session_v1::Event::Stopped => {
@@ -182,6 +182,7 @@ pub struct CapExtImageCopy {
     time: Option<(u32, u32, u32)>,
     in_progress_constraints: BufferConstraints,
     current_config: Option<(DmabufFormat, (u32, u32))>,
+    has_frame: AtomicBool,
 }
 
 impl CaptureSource for CapExtImageCopy {
@@ -224,6 +225,7 @@ impl CaptureSource for CapExtImageCopy {
                 dmabuf_device: None,
             },
             current_config: None,
+            has_frame: AtomicBool::new(false),
         })
     }
 
@@ -232,6 +234,9 @@ impl CaptureSource for CapExtImageCopy {
         eq: &QueueHandle<crate::State<Self>>,
     ) -> Option<(u32, u32, DrmFourcc, Self::Frame)> {
         if let Some((fmt, (w, h))) = &self.current_config {
+            if self.has_frame.swap(true, Ordering::SeqCst) {
+                return None;
+            }
             let frame = self.output_capture_session.create_frame(eq, ());
             Some((*w, *h, fmt.fourcc, frame))
         } else {
@@ -254,5 +259,6 @@ impl CaptureSource for CapExtImageCopy {
 
     fn on_done_with_frame(&self, f: Self::Frame) {
         f.destroy();
+        self.has_frame.store(false, Ordering::SeqCst);
     }
 }
